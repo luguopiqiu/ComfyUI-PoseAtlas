@@ -35,7 +35,7 @@ RuiC-PoseAtlas 本身是一个静态姿态参考图库：每组姿态提供 **�
 | 线稿 | [POSE-DB-01](https://ai-pose-gallery.pages.dev/) | 900×1200 PNG | 抽骨架、图生图、编辑模型 |
 | 深度 | [POSE-DB-02](https://ai-pose-depth-gallery.pages.dev/) | 900×1200 灰度 PNG | ControlNet depth、需要前后关系的合成 |
 
-## 两个节点
+## 三个节点
 
 ### PoseAtlas 姿态图库（`PoseAtlasLoader`）
 
@@ -67,6 +67,22 @@ RuiC-PoseAtlas 本身是一个静态姿态参考图库：每组姿态提供 **�
 只要文字、不要图时用这个。输入 `pose` + `language`（zh / en / ja），输出 `pose_name` / `category` / `series`，方便拼进提示词。
 
 <img src="docs/node-info.jpg" width="300" alt="PoseAtlas 姿态信息节点">
+
+### PoseAtlas 姿态图库＋信息（`PoseAtlasCombined`）
+
+前两个节点的叠加：选一次姿势，同时拿到图和文字，不用摆两个节点、也不会两边选岔。
+
+| | |
+|---|---|
+| 输入 | `pose`（图库选择）、`render`（线稿 / 深度）、`language`（zh / en / ja）、`invert_mask` |
+| 输出 | `image` `IMAGE` · `mask` `MASK` · `pose_name` `STRING` · `pose_text` `STRING` · `category` `STRING` · `series` `STRING` |
+
+- `image` / `mask`：与「姿态图库」完全一致（深度模式下同样自动优先用已下载的原图）
+- `pose_name`：中文显示名，形如 `S形站姿・胯部侧顶（站姿・正面）`；深度模式追加 ` · 深度`，适合当文件名
+- `pose_text`：按 `language` 输出的纯名称（zh / en / ja），适合直接拼提示词
+- `category` / `series`：分类与系列的中文名，与「姿态信息」一致
+
+> 注意两个名字的区别：`pose_name` 带分类与角度（和图库节点一样），`pose_text` 是信息节点里那个 `pose_name`。
 
 ---
 
@@ -143,6 +159,8 @@ python scripts/download_images.py
 ### 最基本的用法：直接出图
 
 拖一个 **PoseAtlas 姿态图库**，点「打开图库」选一张，`image` 输出接到任何吃 `IMAGE` 的节点。
+
+想把姿态描述一起写进提示词，就换成 **PoseAtlas 姿态图库＋信息**：`image` 去采样，`pose_text` 直接进 `CLIP Text Encode`，一个节点搞定。
 
 ### 配合 ControlNet 出图（推荐）
 

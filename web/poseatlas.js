@@ -2,7 +2,7 @@ import { app } from "../../scripts/app.js";
 
 /*
  * ComfyUI-PoseAtlas — 图库选择器
- * 把 PoseAtlasLoader / PoseAtlasInfo 的 pose 下拉框替换成可视化图库面板：
+ * 把 PoseAtlasLoader / PoseAtlasInfo / PoseAtlasCombined 的 pose 下拉框替换成可视化图库面板：
  *   系列 tab → 分类 → 缩略图网格 → 点选后写回下拉值并显示大图预览。
  *
  * 支持「线稿 / 深度」两种渲染。深度原图不随仓库分发（只带 300×400 缩略图），
@@ -12,9 +12,11 @@ import { app } from "../../scripts/app.js";
  * 数据与图片都来自本节点自带的 web/atlas 目录（/extensions/ComfyUI-PoseAtlas/atlas/）。
  */
 
-const NODE_TYPES = new Set(["PoseAtlasLoader", "PoseAtlasInfo"]);
+const NODE_TYPES = new Set(["PoseAtlasLoader", "PoseAtlasInfo", "PoseAtlasCombined"]);
 const WIDGET_NAME = "pose";
 const RENDER_WIDGET = "render";
+const PREVIEW_WIDGET = "pose_preview";
+const PREVIEW_HEIGHT = 280;
 const EXT_BASE = "/extensions/ComfyUI-PoseAtlas/atlas/";
 const API_DATA = EXT_BASE + "index.json";
 const DEPTH_API = "/poseatlas/depth";
@@ -320,6 +322,8 @@ function openGallery(node, widget, atlas) {
         node.setDirtyCanvas && node.setDirtyCanvas(true, true);
         node._paImg = null;
         node._paImgSrc = null;
+        node._paDomSrc = null;
+        refreshPreview(node);
         renderRenderSwitch();
         renderMain();
         updateFoot(atlas.entries.find((e) => e.label === state.current));
@@ -397,6 +401,7 @@ function openGallery(node, widget, atlas) {
     }
     node.setDirtyCanvas && node.setDirtyCanvas(true, true);
     app.graph && app.graph.setDirtyCanvas && app.graph.setDirtyCanvas(true, true);
+    refreshPreview(node);
     updateFoot(entry);
     renderMain();
   }
@@ -557,6 +562,9 @@ function addGalleryButton(node, widget) {
   const btn = node.addWidget("button", "打开图库", null, async () => {
     try {
       const atlas = await getAtlas();
+      // 中途切换到 Nodes 2.0 时补一个 DOM 预览
+      if (vueNodesEnabled()) addPreviewWidget(node);
+      refreshPreview(node);
       openGallery(node, widget, atlas);
     } catch (e) {
       console.error("[PoseAtlas]", e);
@@ -567,14 +575,98 @@ function addGalleryButton(node, widget) {
   return btn;
 }
 
-function drawPreview(node, ctx) {
+/* 节点当前选中的预览图 URL；ATLAS 未加载或没选中时返回 null */
+function previewUrl(node) {
   const widget = node.widgets && node.widgets.find((w) => w.name === WIDGET_NAME);
-  if (!widget) return;
+  if (!widget) return null;
   const entry = ATLAS && ATLAS.entries && ATLAS.entries.find((e) => e.label === widget.value);
-  if (!entry) return;
+  if (!entry) return null;
+  return thumbUrl(entry, renderOf(node));
+}
 
-  const render = renderOf(node);
-  const url = thumbUrl(entry, render);
+/* ---------------------------------------------------------------------------
+ * Nodes 2.0（DOM / Vue 节点）下的预览
+ *
+ * 新版前端开启「现代节点设计（ComfyUI.VueNodes.Enabled，菜单里叫 Nodes 2.0）」
+ * 后，LGraphCanvas.drawNode() 直接 return，不再调用节点的 onDrawForeground，
+ * 所以纯 canvas 绘制的预览会整个消失。这种情况改用 DOM widget 承载预览图。
+ * ------------------------------------------------------------------------- */
+
+function vueNodesEnabled() {
+  try {
+    const v = app.ui && app.ui.settings && app.ui.settings.getSettingValue
+      ? app.ui.settings.getSettingValue("Comfy.VueNodes.Enabled")
+      : undefined;
+    if (typeof v === "boolean") return v;
+  } catch (e) {}
+  return !!(window.LiteGraph && window.LiteGraph.vueNodesMode);
+}
+
+function refreshPreview(node) {
+  const img = node._paDomImg;
+  if (!img) return;
+  const url = previewUrl(node);
+  if (url === node._paDomSrc) return;
+  node._paDomSrc = url;
+
+  const empty = node._paEmpty;
+  if (!url) {
+    img.style.visibility = "hidden";
+    img.removeAttribute("src");
+    if (empty) empty.style.display = "";
+    return;
+  }
+  if (empty) empty.style.display = "none";
+  img.style.visibility = "";
+  img.onerror = () => {
+    img.style.visibility = "hidden";
+    if (empty) empty.style.display = "";
+  };
+  img.src = url;
+}
+
+function addPreviewWidget(node) {
+  if (node._paDomImg || typeof node.addDOMWidget !== "function") return null;
+
+  const wrap = document.createElement("div");
+  wrap.style.cssText =
+    "position:relative;width:100%;height:100%;display:flex;align-items:center;" +
+    "justify-content:center;background:#16181d;border-radius:6px;overflow:hidden;";
+
+  const img = document.createElement("img");
+  img.draggable = false;
+  img.decoding = "async";
+  img.style.cssText =
+    "max-width:100%;max-height:100%;object-fit:contain;display:block;";
+
+  const empty = document.createElement("div");
+  empty.textContent = "未选择姿势";
+  empty.style.cssText = "position:absolute;color:#6b7285;font-size:12px;";
+
+  wrap.append(img, empty);
+
+  const widget = node.addDOMWidget(PREVIEW_WIDGET, "preview", wrap, {
+    serialize: false,
+    hideOnZoom: false,
+    getMinHeight: () => PREVIEW_HEIGHT,
+    getMaxHeight: () => PREVIEW_HEIGHT,
+    getValue: () => "",
+  });
+  widget.serialize = false;
+
+  node._paDomImg = img;
+  node._paEmpty = empty;
+  node._paDomSrc = null;
+  refreshPreview(node);
+  return widget;
+}
+
+function drawPreview(node, ctx) {
+  // 已经有 DOM 预览时不要再画一遍，否则两种模式会叠图
+  if (node._paDomImg) return;
+  const url = previewUrl(node);
+  if (!url) return;
+
   let img = node._paImg;
   if (!img || node._paImgSrc !== url) {
     img = new Image();
@@ -629,6 +721,37 @@ app.registerExtension({
           Math.max((this.size && this.size[0]) || 0, 260),
           Math.max((this.size && this.size[1]) || 0, 340),
         ];
+        // Nodes 2.0 下 canvas 不再回调 onDrawForeground，改用 DOM widget 显示预览
+        if (vueNodesEnabled()) {
+          addPreviewWidget(this);
+          const node = this;
+          getAtlas()
+            .then(() => refreshPreview(node))
+            .catch(() => {});
+        }
+        // 直接在节点上切换「线稿 / 深度」时也要更新 DOM 预览
+        const renderWidget = this.widgets.find((w) => w.name === RENDER_WIDGET);
+        if (renderWidget) {
+          const origCb = renderWidget.callback;
+          const node = this;
+          renderWidget.callback = function () {
+            const out = origCb && origCb.apply(this, arguments);
+            node._paDomSrc = null;
+            refreshPreview(node);
+            return out;
+          };
+        }
+      }
+      return r;
+    };
+
+    // 载入工作流 / 前端重设控件值后，刷新 DOM 预览
+    const onConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function () {
+      const r = onConfigure && onConfigure.apply(this, arguments);
+      if (this._paDomImg) {
+        this._paDomSrc = null;
+        refreshPreview(this);
       }
       return r;
     };

@@ -3,8 +3,9 @@ ComfyUI-PoseAtlas
 =================
 把 RuiC-PoseAtlas（288 组姿态 / 1439 张多角度人台线稿）打包成 ComfyUI 节点。
 
-PoseAtlasLoader  从内置图库选一张图 → IMAGE / MASK / STRING
-PoseAtlasInfo    只取所选姿态的文字信息 → STRING / STRING
+PoseAtlasLoader    从内置图库选一张图 → IMAGE / MASK / STRING
+PoseAtlasInfo      只取所选姿态的文字信息 → STRING / STRING
+PoseAtlasCombined  上面两个节点的叠加：一次选择同时输出图片与文字信息
 
 每个姿态变体都有两套渲染，用 `render` 参数切换：
 
@@ -148,6 +149,53 @@ def _resolve_depth(meta):
     return full, False
 
 
+def _pose_name(meta, render, degraded=False):
+    """节点上显示 / 输出的姿态名：中文名（分类・角度），深度模式带后缀。"""
+    name = f"{meta['zh']}（{meta['category']}・{meta['angle_name']}）"
+    if render == RENDER_DEPTH:
+        name += " · 深度"
+        if degraded:
+            name += DEGRADED_NOTE
+    return name
+
+
+def _load_pose_image(meta, render, invert_mask=False):
+    """按 render 读取所选姿态，返回 (image, mask, degraded)。
+
+    Loader 与「图库＋信息」共用这段逻辑，避免两处读图代码走偏。
+    """
+    degraded = False
+    if render == RENDER_DEPTH:
+        path, degraded = _resolve_depth(meta)
+    else:
+        path = _atlas_path(meta["file"])
+
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"PoseAtlas: 图片未下载 —— {path}\n"
+            f"图片版权归原作者所有，不随本仓库分发。请先在节点目录执行：\n"
+            f"    python scripts/download_images.py\n"
+            f"下载完成后重启 ComfyUI。"
+        )
+
+    img = Image.open(path)
+    img.load()
+    has_alpha = img.mode in ("RGBA", "LA") or (
+        img.mode == "P" and "transparency" in img.info
+    )
+    if has_alpha:
+        alpha = np.array(img.convert("RGBA").split()[-1], dtype=np.float32) / 255.0
+    else:
+        alpha = np.ones((img.height, img.width), dtype=np.float32)
+
+    arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
+    image = torch.from_numpy(arr)[None,]
+    mask = torch.from_numpy(alpha)[None,]
+    if invert_mask:
+        mask = 1.0 - mask
+    return image, mask, degraded
+
+
 class PoseAtlasLoader:
     """从内置姿态图库选图，输出 IMAGE / MASK。"""
 
@@ -186,42 +234,8 @@ class PoseAtlasLoader:
         if meta is None:
             raise ValueError(f"PoseAtlas: 找不到姿态 '{pose}'")
 
-        degraded = False
-        if render == RENDER_DEPTH:
-            path, degraded = _resolve_depth(meta)
-        else:
-            path = _atlas_path(meta["file"])
-
-        if not os.path.isfile(path):
-            raise FileNotFoundError(
-                f"PoseAtlas: 图片未下载 —— {path}\n"
-                f"图片版权归原作者所有，不随本仓库分发。请先在节点目录执行：\n"
-                f"    python scripts/download_images.py\n"
-                f"下载完成后重启 ComfyUI。"
-            )
-
-        img = Image.open(path)
-        img.load()
-        has_alpha = img.mode in ("RGBA", "LA") or (
-            img.mode == "P" and "transparency" in img.info
-        )
-        if has_alpha:
-            alpha = np.array(img.convert("RGBA").split()[-1], dtype=np.float32) / 255.0
-        else:
-            alpha = np.ones((img.height, img.width), dtype=np.float32)
-
-        arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
-        image = torch.from_numpy(arr)[None,]
-        mask = torch.from_numpy(alpha)[None,]
-        if invert_mask:
-            mask = 1.0 - mask
-
-        name = f"{meta['zh']}（{meta['category']}・{meta['angle_name']}）"
-        if render == RENDER_DEPTH:
-            name += " · 深度"
-            if degraded:
-                name += DEGRADED_NOTE
-        return (image, mask, name)
+        image, mask, degraded = _load_pose_image(meta, render, invert_mask)
+        return (image, mask, _pose_name(meta, render, degraded))
 
 
 class PoseAtlasInfo:
@@ -254,14 +268,76 @@ class PoseAtlasInfo:
         )
 
 
+class PoseAtlasCombined:
+    """姿态图库 + 姿态信息：一次选择，同时拿到图片和文字。
+
+    相当于把 PoseAtlasLoader 与 PoseAtlasInfo 叠在一起：
+    `image` / `mask` 与图库节点一致，`pose_name` / `pose_text` / `category` /
+    `series` 与信息节点一致，省掉「选两次姿势、连两根线」的麻烦。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        labels = _labels()
+        return {
+            "required": {
+                "pose": (labels, {"default": labels[0] if labels else ""}),
+                "render": ([RENDER_LINE, RENDER_DEPTH], {
+                    "default": RENDER_LINE,
+                    "tooltip": "线稿 = POSE-DB-01 人台线稿；深度 = POSE-DB-02 灰度深度图（白=近）",
+                }),
+                "language": (["zh", "en", "ja"], {
+                    "default": "zh",
+                    "tooltip": "pose_text 的输出语言；pose_name 始终是中文显示名",
+                }),
+            },
+            "optional": {
+                "invert_mask": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "反转 MASK（人台图无 alpha，默认全 1）",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("image", "mask", "pose_name", "pose_text", "category", "series")
+    FUNCTION = "load"
+    CATEGORY = "PoseAtlas"
+    DESCRIPTION = ("姿态图库与姿态信息的叠加节点：输出 IMAGE / MASK 的同时，"
+                   "给出带角度的 pose_name、按 language 的纯名称 pose_text，"
+                   "以及 category / series，直接拼进提示词。")
+
+    @classmethod
+    def IS_CHANGED(cls, pose="", render=RENDER_LINE, language="zh",
+                   invert_mask=False, **kwargs):
+        return f"{pose}|{render}|{language}|{invert_mask}"
+
+    def load(self, pose, render=RENDER_LINE, language="zh", invert_mask=False):
+        meta = _resolve(pose)
+        if meta is None:
+            raise ValueError(f"PoseAtlas: 找不到姿态 '{pose}'")
+
+        image, mask, degraded = _load_pose_image(meta, render, invert_mask)
+        return (
+            image,
+            mask,
+            _pose_name(meta, render, degraded),
+            meta.get(language) or meta["zh"],
+            meta["category"],
+            meta["series_name"],
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAtlasLoader": PoseAtlasLoader,
     "PoseAtlasInfo": PoseAtlasInfo,
+    "PoseAtlasCombined": PoseAtlasCombined,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseAtlasLoader": "PoseAtlas 姿态图库",
     "PoseAtlasInfo": "PoseAtlas 姿态信息",
+    "PoseAtlasCombined": "PoseAtlas 姿态图库＋信息",
 }
 
 
